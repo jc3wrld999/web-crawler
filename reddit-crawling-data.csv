@@ -1,0 +1,607 @@
+id,subreddit,title,body,url,score,num_comments
+10oazg7,MachineLearning,[D] 간단한 질문 스레드,"Please post your questions here instead of creating a new thread. Encourage others who create new posts for questions to post here instead!
+
+Thread will stay alive until next one so keep posting after the date in the title.
+
+Thanks to everyone for answering questions in the previous thread!",https://www.reddit.com/r/MachineLearning/comments/10oazg7/d_simple_questions_thread/,7,103
+10xjwac,MachineLearning,[D] 이미지 모델의 출현 능력이 있습니까?,"Just finished reading the Stanford/Google survey paper ([https://arxiv.org/abs/2206.07682](https://arxiv.org/abs/2206.07682)) on emergent abilities of large language models. It made me wonder: do image generation models have emergent abilities, too? Do we know?
+
+I can't quite wrap my head around what such an ability would even look like. Figured maybe other folks had given this a think.",https://www.reddit.com/r/MachineLearning/comments/10xjwac/d_are_there_emergent_abilities_of_image_models/,38,10
+10xp54e,MachineLearning,[P] Kernl에서 Openai Whisper가 큰 2 배 빠른 전사를 받으십시오.,"We are happy to announce the support of OpenAI Whisper model (ASR task) on Kernl. 
+
+We focused on high quality transcription in a latency sensitive scenario, meaning:
+
+* *whisper-large-v2* weights
+* *beam search 5 (as recommended in the related paper)*
+
+We measured a 2.3x speedup on Nvidia A100 GPU (2.4x on 3090 RTX) compared to Hugging Face implementation using FP16 mixed precision on transcribing librispeech test set (over 2600 examples). For now, OpenAI implementation is [not yet PyTorch 2.0 compliant](https://github.com/openai/whisper/pull/115).
+
+In the post below, we discuss what worked (CUDA Graph), our tricks (to significantly reduce memory footprint), and what did not pay off (Flash attention and some other custom Triton kernels).
+
+* **Kernl repository**: [https://github.com/ELS-RD/kernl](https://github.com/ELS-RD/kernl)
+* **Reproduction script**: [https://github.com/ELS-RD/kernl/blob/main/experimental/whisper/speedup.ipynb](https://github.com/ELS-RD/kernl/blob/main/experimental/whisper/speedup.ipynb)
+
+# Unsung hero: CUDA graphs
+
+CUDA graphs technology provides most of the speed up. Compared to vanilla PyTorch 2.0 (“reduce-overhead mode”), we provide a limited memory footprint when vanilla PyTorch 2.0 may raise OOM exception.
+
+[memory footprint](https://preview.redd.it/jyfayud5d4ha1.png?width=1598&format=png&auto=webp&v=enabled&s=79bd34de7dee5ef403b4cccc60785c322dfa38ec)
+
+Experiments have been run on a 3090 RTX with 24 Gb DDR. A reminder that PyTorch 2.0 focuses on training, not inference, which may explain why it OOMs rapidly in this case.
+
+At its beginning, many partitioners were surprised by PyTorch eager mode performances, when compared to TensorFlow 1.x compiled models: they were on par! Python brought its flexibility and ease of debugging without implying any significant performance cost.
+
+This is mostly because GPUs are latency hiding hardware: when PyTorch launches an operation on GPU, it sends instructions from host (CPU) to a queue (the CUDA stream), which allows PyTorch to continue Python script execution without having to wait for CUDA kernel to finish its work. This strategy effectively hides most of the Python overhead, in particular when there are some computation costly operations like convolutions or matrix multiplications.
+
+Each new generation of GPUs being much faster than its predecessor, this strategy could not last forever, according to one PyTorch maintainer, it is an “existential problem” ([dev podcast](https://pytorch-dev-podcast.simplecast.com/episodes/pytorch-20), around 8mn30).
+
+In inference mode, especially in latency-sensitive scenarios where batch size tends to be low, there is often little computation to perform (regarding what modern GPUs can do), making it even harder to hide effectively Python overhead. It’s accentuated in the case of generative models like Whisper, because each decoder call focuses on generating a single token, and a part of the computation is cached for the next token.
+
+This is a typical situation where CUDA graph is very helpful.
+
+The main idea behind CUDA graph is that we can replace a series of instructions sent from host (CPU) to device (GPU) by one call referring to a graph of instruction stored in GPU. Check also this twitter [thread](https://twitter.com/cHHillee/status/1616906059368763392) for more explanations.
+
+First it will observe the inference of a model for specific input shapes and then replay it without going through most of the Python code.
+
+One constraint is that it will replay the exact same operations with the exact same arguments.
+
+For instance, memory addresses used by kernels are captured and therefore need to be static. For input tensors, it means that for each inference, we need to allocate some GPU memory and copy them there before the capture and copy all the following input tensors at the very same place.
+
+The second constraint is that dynamic shapes are not supported by CUDA graph because it captures everything. We could have our own machinery in front of the model, but PyTorch 2.0 offers the right tooling to manage that point out of the box.
+
+Basically, dynamo offers a mechanism which checks if the model has already been captured for specific input shapes and some other states and capture it if not yet the case. You just have to provide a function which converts to CUDA graphs and you are done.
+
+Out of the box, PyTorch 2.0 provides a “reduce-overhead” mode which applies CUDA graph to the model. Unfortunately, for now, it will raise an OOM with Whisper large or medium because it reserves some CUDA space for each input shape. Therefore, for a generative model it rapidly fulfills the GPU memory, in particular because of the K/V cache which can be huge.
+
+We have worked around this constrain by building our own layer on top of the memory pool of PyTorch. 
+
+Basically, a PyTorch tensor is made of 2 parts, a CUDA allocated memory represented by PyTorch as a “storage”, and a bunch of metadata associated with it. Among the metadata there is a CUDA memory address, the tensor shape plus its strides, its dtype and... a memory offset.
+
+Our idea is to create a very large tensor and share its storage between several input tensors, using offset metadata. With this solution, we avoid specializing in input tensor shapes and share the reserved memory for different input shapes related to several CUDA graphs.
+
+As shown in the table above, it significantly reduces the memory overhead.
+
+# What about custom (Triton) kernels for attention?
+
+**TL; DR: we tried, they work, we got up to 2 times faster than eager PyTorch for cross attention and they bring close to nothing in e2e latency mostly because the improvement is not big enough to matter 🙁**
+
+Below, we follow the convention of naming Q, K and V, the 3 tensors used in the attention of transformer models.
+
+Whisper is based on a classic transformer architecture, with an encoder and a decoder.
+
+Two characteristics of this model are of interest:
+
+* The shape of Q tensor used in cross-attention is always \[batch, #heads, 1, 1500\].
+* Model has been trained on 30-second audio files and their associated transcript. Because audio files are short, the sequence to generate is usually short, fewer than 50 tokens most of the time.
+
+Because of these characteristics, optimizing attention has a low reward. In particular, the now common trick “replace attention with flash attention” is counterproductive:
+
+* self-attention: sequences are very short, so quadratic complexity is less of an issue;
+* cross-attention: using flash-attention leads to a 2 times slower inference on this part of the model.
+
+We have tried to work on the second point and thought we could make cross attention faster.
+
+Usual attention implementation (self and cross) relies on a series of operations: matmul (Q x K\^t) -> rescale -> SoftMax -> matmul (SoftMax output x V). Intermediate output tensors have a shape which usually scales quadratically with input sequence length. They will be saved and reloaded from DDR, and memory bandwidth is a very scarce resource in GPUs.
+
+To optimize speed, flash attention fuses operations, so basically first matmul will work on a small part of Q and K, and directly apply SoftMax to it without saving intermediate results to DDR. Same for second matmul. Because we don't go and back through GPU main memory, flash attention usually runs much faster than naïve implementation of attention.
+
+The parallelization of the jobs is done on different axes: [batch and attention head for the original flash attention](https://github.com/HazyResearch/flash-attention/issues/40), and Triton author added a third one, tokens, aka third dimension of Q (this important trick is now also part of flash attention CUDA implementation).
+
+In the Whisper latency sensitive case, this doesn’t work well. The size of batches is low and sequence length (third dimension of Q tensor) is... 1! So, even if each job is done very efficiently, our GPU occupancy is low, and basically most of its streaming processors are idle. At the end of the day, the FA kernel is up to 2 times slower than eager PyTorch implementation (depending on batch size and model size).
+
+# Try 1: the very simple kernel
+
+We noted that there is little computation to do and that we were memory bandwidth bounded. It means that most of the time we wait for data to be transferred from main memory to shared memory. 
+
+We leveraged that fact in a very simple kernel with 2 optimizations:
+
+* after having finishing the rescale of the QK\^t matmul, we perform the SoftMax computation in parallel of loading V tensor for the final matmul. The SoftMax computation finishes before the end of the V loading, so basically it costs us nothing;
+* to achieve best performances, we also changed the memory layout of V tensor in a way where we get a coalesced access, so we lowered the pressure on the memory bandwidth and increased instruction throughput (coalesced access let you load up to 128 bytes in a single instruction so you need less of them, which lets you perform more other things)
+
+Altogether this cross attention was up to 2x faster compared to eager. It appeared to bring between 5 to 20% in end-to-end benchmark depending on model size and batch size. Cool but far from being a game changer, it requires a modification specific to Whisper model (memory layout of V) which is not in the spirit of the Kernl library. We decided to search for another way of doing things (we kept the code in the library for possible future use case).
+
+# Try 2: Skinny Flash Attention
+
+Our second try is based on the very same trick as Flash Attention (parallel SoftMax) but is designed for tall and skinny tensors, which is inspired by split-k strategy in GEMM (a close cousin of the matmul). The main idea is to add a new parallelization axis over the 3rd dimension of K tensor. The next steps are in the same spirit as flash attention with a difference that we need a new reduction operation between the different jobs' outputs. It provides 5-10% speedup compared to eager implementation on this setup at kernel level. We kept that kernel to ease the next feature we are working on (quantization) but the effect in end-to-end latency is inferior to 5% (still it exists 😅).
+
+Some thoughts about PyTorch 2.0, Triton and making things much faster
+
+Playing with PyTorch ~~1.14~~ 2.0 since this summer made us quite convinced that the major update to be released very soon will be a game changer for the ML field.
+
+For inference (but also for training), the parallel with PyTorch vs TensorFlow is obvious to our eyes. 
+
+The traditional way to deploy a model is to export it to Onnx, then to TensorRT plan format. Each step requires its own tooling, its own mental model, and may raise some issues. The most annoying thing is that you need Microsoft or Nvidia support to get the best performances, and sometimes model support takes time. For instance, T5, a model released in 2019, is not yet correctly supported on TensorRT, in particular K/V cache is missing ([soon it will be according to TensorRT maintainers](https://github.com/NVIDIA/TensorRT/issues/1845), but I wrote the very same thing almost 1 year ago and then 4 months ago so… I don’t know).
+
+PyTorch 2.0 makes the graph capture step easy, it has been designed to work even if not everything is PyTorch compliant. With its Python first philosophy, it provides flexibility and debuggability. 
+
+Several years ago, some said that by design PyTorch can’t be as performant than Tensorflow because of its eager execution model, compilation has to be faster. The same thing could be said for OnnxRuntime or TensorRT, they are C++ stuff, they have less overhead, etc. But at the end of the day, it's always the “ease of use” which is decisive. Ease of use because of Python, but also because of the transparency in the process, Triton makes understanding and debugging kernels much easier than closed source TensorRT Myelin engine calling closed source cuBlas library.
+
+And of course, like TensorFlow, there will be many use cases where dedicated tools will be best choices, starting with situations where you can’t deploy a Python interpreter.
+
+The second lesson, Triton is easier to start with than CUDA, but you probably can’t write or debug highly performant code without being able to, at least, read and debug PTX/SASS instructions. We realized that when we had some performance issues... The good news is that PTX is understandable, and you will probably spot unexpected generated code with some effort if there is any. Moreover, CUDA probably requires the same care when you really focus on performances.
+
+We had plenty of issues with Triton, for example, cosmetics change in code may raise segfault. At some point you finish by having an intuition of what kinds of patterns to follow to make things work, in particular when there are for loops and dot operations. A new version of Triton has recently been released after a full rewrite of its backend, our little tests showed some improvement on stability but we have not yet fully switched.
+
+As in my previous post, I highly recommend that readers start playing with Triton library, I rewrite it here: it’s fun (at least when it doesn’t segfault) and helps you to make sense of a large part of what is happening in ML engineering. I am quite convinced many flash attention like kernels are still to be written. 
+
+# Caveat
+
+Two important things to note about the project described here:
+
+* CUDA graphs require us to capture a graph per input tensor shape, there is a non-negligible warmup time. We measure around 10mn on 2 different machines / GPUs (down from 50mn in our previous Kernl version). One user reported with the new version a bit more than 20mn of warmup time. We are aware of obvious ways to decrease it significantly.
+* The context here is latency sensitive optimization. In throughput sensitive one, just increasing batch size will bring you most of the speedup. Otherwise, more aggressive optimizations like quantization are required (not yet released on Kernl).",https://www.reddit.com/r/MachineLearning/comments/10xp54e/p_get_2x_faster_transcriptions_with_openai/,11,6
+10x519c,MachineLearning,[r] pix2pixzero- 제로 샷 이미지-이미지 변환,,https://arxiv.org/pdf/2302.03027.pdf,98,10
+10xgvhj,MachineLearning,[D] 매우 나쁜 품질 사운드 레코딩을 개선하는 데 사용할 수있는 AI 모델이 있습니까?소음 제거 및 전반적인 품질 향상,"I have got old lecture recordings
+
+I want to improve their sound quality
+
+I have tested adobe AI noise removal but not very good
+
+I also tested descript studio sound not very good either
+
+I wonder if there are any public model, github repo, github project, hugging face repo that I can use to remove noise and improve sound quality of existing audio recordings?
+
+Thank you so much for replies
+
+Recordings are in English
+
+Here example recording that needs to be cleaned 5 min audio : [https://sndup.net/stjs/](https://sndup.net/stjs/)
+
+full lecture : [https://youtu.be/2zY1dQDGl3o](https://youtu.be/2zY1dQDGl3o)",https://www.reddit.com/r/MachineLearning/comments/10xgvhj/d_are_there_any_ai_model_that_i_can_use_to/,14,13
+10xqtn2,MachineLearning,[D] 꿀벌 : ML 모델 크기에 대한 새로운 측정 단위,Would like to hear about what you guys think about [this](https://www.lesswrong.com/posts/YKfNZAmiLdepDngwi/gpt-175bee) approach?,https://www.reddit.com/r/MachineLearning/comments/10xqtn2/d_bees_a_new_unit_of_measurement_for_ml_model_size/,1,0
+10xiexu,MachineLearning,최신 뉴스로 최신 정보를 유지하기에 가장 좋은 리소스는 무엇입니까?[디],"I am very interested in the field of artificial intelligence.
+
+Can you recommend me some YouTube channels, websites/blogs, magazines and other places on the internet where I would be informed of the latest news in this environment ?",https://www.reddit.com/r/MachineLearning/comments/10xiexu/what_are_the_best_resources_to_stay_up_to_date/,4,18
+10xmm87,MachineLearning,[D] ICML 튜토리얼 제출 형식?,"Hello!   
+
+
+I'm quite new to this. I was wondering what the right format is for submitting a successful tutorial proposal. Should I just use the LaTeX style files but modify the content for a tutorial proposal?",https://www.reddit.com/r/MachineLearning/comments/10xmm87/d_format_for_icml_tutorial_submission/,2,0
+10xj2vv,MachineLearning,[d] 개별 표현을 가진 자동 인코더의 성공 이해,"Hi, I'm trying to reason about the recent successes of autoencoders that learn discrete representations or latents, eg vq-vae. In particular, I am interested in understanding why they seem to work very well vs. their counterparts with continuous representations or latents.
+
+My current understanding is that:
+
+* Discrete representations constrain the space for representation, harder to memorize data?
+* Potentially simpler to interpret
+* Some things may be modeled more naturally with discrete variables
+
+Is there more to the success? I'm thinking about starting a side project related to synthesizing audio, and have read about the successes vq-vaes have seen on speech - this makes some sense to me, where discrete latents may map to phonemes.
+
+On audio more generally (ie not just speech) I'm not sure why this would be the case , however after seeing the successes of these types of models on images - I feel like i've lost my ability to reason about  these models.",https://www.reddit.com/r/MachineLearning/comments/10xj2vv/d_understanding_the_successes_of_autoencoders/,4,0
+10w6g7n,MachineLearning,"[N] Getty Images는 안정된 확산이 1,200 만 명의 저작권이있는 이미지를 도난했다고 주장하며 각 이미지마다 $ 150,000가 필요합니다.","From [Article](https://www.theinsaneapp.com/2023/02/getty-images-stable-diffusion.html):
+
+Getty Images new lawsuit claims that Stability AI, the company behind Stable Diffusion's AI image generator, stole 12 million Getty images with their captions, metadata, and copyrights ""without permission"" to ""train its Stable Diffusion algorithm.""
+
+The company has asked the court to order Stability AI to remove violating images from its website and pay $150,000 for each. 
+
+However, it would be difficult to prove all the violations. Getty submitted over 7,000 images, metadata, and copyright registration, used by Stable Diffusion.",https://www.reddit.com/r/MachineLearning/comments/10w6g7n/n_getty_images_claims_stable_diffusion_has_stolen/,630,314
+10uy5z1,datascience,"주간 입력 및 전환 - 스레드 06 Feb, 2023-13, 2023 년 2 월 13 일"," 
+
+Welcome to this week's entering & transitioning thread! This thread is for any questions about getting started, studying, or transitioning into the data science field. Topics include:
+
+* Learning resources (e.g. books, tutorials, videos)
+* Traditional education (e.g. schools, degrees, electives)
+* Alternative education (e.g. online courses, bootcamps)
+* Job search questions (e.g. resumes, applying, career prospects)
+* Elementary questions (e.g. where to start, what next)
+
+While you wait for answers from the community, check out the [FAQ](https://www.reddit.com/r/datascience/wiki/frequently-asked-questions) and Resources pages on our wiki. You can also search for answers in [past weekly threads](https://www.reddit.com/r/datascience/search?q=weekly%20thread&restrict_sr=1&sort=new).",https://www.reddit.com/r/datascience/comments/10uy5z1/weekly_entering_transitioning_thread_06_feb_2023/,4,85
+10xcnjs,datascience,중간 정도의 가치가 있습니까?,I’m looking for good blog / news sites for learning new topics and staying up on everything data science / machine learning related. Medium seems to be perfect for that but I wanted to know if there was any other suggestions anyone has; Is medium worth the $5 / month $50/ yearly pay wall?,https://www.reddit.com/r/datascience/comments/10xcnjs/is_medium_worth_it/,72,74
+10xhyye,datascience,노인에서 DS를 이끌고 급여 충돌은 작습니다,"I got a promotion from Senior DS (150 base, 175 TC) to Lead DS (160 base, 185 TC).
+
+I have about 3.5 years experience leading teams, 6.5 years total. I joined this company a little over a year ago as an IC for the pay bump and was asked to lead the team after a couple of months.
+
+The model I inherited made < $1mm annually, and now it's on track for $2.5 - $3 mm since I took over. All stakeholders are happy, and I'm well liked within DS according to my boss and his boss. 10k feels like a very small difference, not a large enough difference for the promo or the scope of responsibility. Thoughts?",https://www.reddit.com/r/datascience/comments/10xhyye/salary_bump_from_senior_to_lead_ds_feels_small/,21,33
+10wr7ps,datascience,채용 과정을 통해 거짓말을합니까?,"I recently stumbled upon a job that is as close as it gets to being a dream job for me: a data scientist position in a physics-related setting, considering that I have a PhD in physics where I mostly did machine learning. Even the subfield of physics matches. 
+
+Reading through the job offer I got pretty confident that I was a really good match, fitting almost everything they needed plus some more of my own strengths, etc. So obviously I applied. There's the usual upload your resume, basic information, etc.
+
+Then the website brings me to a new page where they ask a few basic questions which I answer truthfully and in a positive way. Until I reach: ""Do you have any experience with Federated Learning?""  The real answer is No, I don't. And that's what I clicked, being honest and all. But I realise that clicking No means _being automatically rejected / filtered away without a chance of defending myself!_ In front of a human recruiter, I would say no but that the concept does not sound so daunting and that I have proven track at fast adaptation and learning, which means I'm likely to very quickly pick it up. But there is no human recruiter in front of me. And in that way, I cannot emphasise on all the technical and non-technical aspects that would be my strengths for that job. Which leads to: a mediocre candidate with some experience at that specific skill has a higher chance that an almost perfect match which is only lacking in that area. 
+
+Meaning: I'm getting rejected from a dream job without a chance to even defend that I'm a very good match.
+
+So of course, I'm thinking of simply lying the next time. Sure, the lie may get discovered by the recruiter later on in the process but then I at least have a chance at arguing or defending my way in. 
+
+Anticipating the comment about learning Federated Learning: sure I can do that, but the next job is going to ask for a different skill. And then another different one. Etc. And some of these skills are sort of hard to actually justify an experience on when you do not have the infrastructure (e.g. multiple servers for Federated Learning).
+
+What do you all think?",https://www.reddit.com/r/datascience/comments/10wr7ps/lie_through_the_hiring_process/,225,73
+10wzrer,datascience,데이터 엔지니어 작업을해야합니까?,"Hello, I am a graduate who was applying for Data Science and Data Analytics jobs, I recently got an offer for a Data Engineer position. I don't seem to be having too much luck with Data Science jobs, I understand that while Data Engineers still work closely with Data Scientists and Analysts that they require different skill sets. If I were to keep practising my Data Science skills could I still expect a data science-like job in the future or should I expect to stay in data engineering if I take this job?
+
+&#x200B;
+
+Any advice is appreciated, thank you.",https://www.reddit.com/r/datascience/comments/10wzrer/should_i_take_a_data_engineer_job/,60,50
+10xnwpe,datascience,모델을 평가할 때 무작위성 (예 : 샘플링)을 다루는 방법,"Hi all
+
+I'm sampling around 2% of the dataset to build a classification model using XGBOOST.
+
+I notice that when I re-run the whole pipeline I get quiet different results, something that could be explained by the sampling process. That's an issue when I compare to different models and the differences are small (i.e., not sure if they due to chance or not).
+
+How do you normally deal with that? Is there a way to build a 95% CI around the PR curve?",https://www.reddit.com/r/datascience/comments/10xnwpe/how_to_deal_with_randomness_eg_sampling_when/,3,4
+10xf4vc,datascience,인터뷰 - LightgBM과 비교할 모델은 무엇입니까?,"I am solving a regression case for an interview. They gave a dataset with 12 features and 800 observations. I made a regression model in LightGBM and it performed really well in the validation dataset. 
+
+The problem is that it is the only model I made and I would like to try more things to show to my interviewer. Some thoughts:
+
+&#x200B;
+
+1. I thought about making a traditional linear regression to compare LightGBM with but the data they gave does not hold the assumptions of a linear model (i.e. residuals not normally dist.)
+2. I thought about XGBoost but, as far as I know, its performance is similar to LightGBM but LightGBM is faster and uses less memory
+3. Neural networks are not even considered given the size of the dataset
+
+The instructions of the case say that the company is not so well interested in the prediction itself. They explicit say that the approach used to solve the task is more important than the prediction, especially because the data was randomly generated. In this case should I stress with making more models? 
+
+Given that the instructions talk about the approach, I did an extensively EDA, stated all my findings, why I chose to use LightGBM, etc.",https://www.reddit.com/r/datascience/comments/10xf4vc/interview_which_models_to_compare_lightgbm_with/,8,26
+10xq8tz,datascience,소매 판매 2018–2022 기사,,https://medium.com/@mahmoudchami/retail-sales-2018-2022-7ab80fd684c3,1,0
+10xpulq,datascience,데이터 과학에 대한 집중력이 가장 유망한 것은 무엇입니까?,"Though there still is a few semesters left before I have to, eventually I will have to select a concentration for my B.S. degree in *Data Science and Mathematics Engineering*. This are the options available to me in my college: 
+
+* ***Advanced Artificial Intelligence for Data Science***
+* ***Cyber-Physical Systems***
+* ***Cybersecurity***
+* ***Data Science in Healthcare***
+* ***Digital Mindset for Start Ups***
+* ***Epidemiology for Public Health Problem Solving***
+* ***Open Innovation and Technology Transfer***
+* ***Operational Evolution for Industry***
+* ***Systems and Technologies 4.0***
+* ***Data Analytics and Artificial Intelligence Tools***
+* ***Financial Vision for Decision-Making***
+
+\[ If any of these sound vague or weird, it is because they are translated. \]
+
+When it comes to a concentration, I know the most important thing is to choose something I feel passionate about... but I was also wondering what concentration the subreddit thinks would be most promising in the future... better pay, better hours, more job options/opportunities, necessity for people in that concentration, etc.",https://www.reddit.com/r/datascience/comments/10xpulq/what_concentration_for_data_science_is_the_most/,1,1
+10xphdz,datascience,이것이 내 데이터를 인코딩하는 가장 좋은 방법입니다,"Hi! I am new to ML and was wondering which encoding I should use.
+
+&#x200B;
+
+First, my mission:  
+Predict flight coefficient based on historical data.
+
+My data:
+
+Int: year, month, day, week\_day (of the flight)
+
+string: classname (like UberX or Uber\_Select), departure\_country, departure\_city, departure\_airport, arrival\_airport, arrival\_city, arrival\_country
+
+&#x200B;
+
+target - coefficient: float
+
+&#x200B;
+
+So **a lot** of categorical data.
+
+I attempted pandas get\_dummy and OneHotEncoding, which create those really large sparse matrixes. I read an article suggesting TargetEncoding, but that would make it harder for my model to find inter-relationships among this data (and I am sure there are)
+
+&#x200B;
+
+So if anyone can help me out choosing the right method, I would appreciate it greatly!
+
+I work with python, just in case",https://www.reddit.com/r/datascience/comments/10xphdz/which_is_the_best_way_to_encode_my_data/,1,1
+a3oicn,hacking,해킹을 시작하는 방법?정보 보안에 대한 궁극적 인 두 경로 안내서.,"Before I begin - everything about this should be totally and completely ethical at it's core. I'm not saying this as any sort of legal coverage, or to not get somehow sued if any of you screw up, this is genuinely how it should be. The idea here is **information security.** I'll say it again. **information security.** The whole point is to make the world a better place. **This isn't for your reckless amusement and shot at recognition with your friends.** **This is for the betterment of human civilisation. Use your knowledge to solve real-world issues.**
+
+&#x200B;
+
+There's no singular all-determining path to 'hacking', as it comes from knowledge from all areas that eventually coalesce into a general intuition. Although this is true, there are still two common rapid learning paths to 'hacking'. I'll try not to use too many technical terms.
+
+&#x200B;
+
+The first is the simple, effortless and result-instant path. This involves watching youtube videos with green and black thumbnails with an occasional anonymous mask on top teaching you how to download well-known tools used by thousands daily - or in other words the 'Kali Linux Copy Pasterino Skidder'. You might do something slightly amusing and gain bit of recognition and self-esteem from your friends. Your hacks will be 'real', but anybody that knows anything would dislike you as they all know all you ever did was use a few premade tools. The communities for this sort of shallow result-oriented field include [r/HowToHack](https://www.reddit.com/r/HowToHack) ~~and probably r/hacking as of now~~.
+&#x200B;
+
+
+The second option, however, is much more intensive, rewarding, and mentally demanding. It is also much more fun, if you find the right people to do it with. It involves learning everything from memory interaction with machine code to high level networking - all while you're trying to break into something. This is where Capture the Flag, or 'CTF' hacking comes into play, where you compete with other individuals/teams with the goal of exploiting a service for a string of text (the flag), which is then submitted for a set amount of points. It is essentially competitive hacking. Through CTF you learn literally everything there is about the digital world, in a rather intense but exciting way. Almost all the creators/finders of major exploits have dabbled in CTF in some way/form, and almost all of them have helped solve real-world issues. However, it does take a lot of work though, as CTF becomes much more difficult as you progress through harder challenges. Some require mathematics to break encryption, and others require you to think like no one has before. If you are able to do well in a CTF competition, there is no doubt that you should be able to find exploits and create tools for yourself with relative ease. The CTF community is filled with smart people who can't give two shits about elitist mask wearing twitter hackers, instead they are genuine nerds that love screwing with machines. There's too much to explain, so I will post a few links below where you can begin your journey.
+
+&#x200B;
+
+Remember - this stuff is not easy if you don't know much, so google everything, question everything, and sooner or later you'll be down the rabbit hole far enough to be enjoying yourself. CTF is real life and online, you will meet people, make new friends, and potentially find your future.
+
+&#x200B;
+
+What is CTF? (this channel is gold, use it) - [https://www.youtube.com/watch?v=8ev9ZX9J45A](https://www.youtube.com/watch?v=8ev9ZX9J45A)
+
+More on /u/liveoverflow, [http://www.liveoverflow.com](http://www.liveoverflow.com) is hands down one of the best places to learn, along with r/liveoverflow
+
+CTF compact guide - [https://ctf101.org/](https://ctf101.org/)
+
+Upcoming CTF events online/irl, live team scores - [https://ctftime.org/](https://ctftime.org/)
+
+What is CTF? - [https://ctftime.org/ctf-wtf/](https://ctftime.org/ctf-wtf/)
+
+Full list of all CTF challenge websites - [http://captf.com/practice-ctf/](http://captf.com/practice-ctf/)
+
+\> be careful of the tool oriented offensivesec oscp ctf's, they teach you hardly anything compared to these ones and almost always require the use of metasploit or some other program which does all the work for you.
+
+* [**http://pwnable.tw/**](http://pwnable.tw/) (a newer set of high quality pwnable challenges)
+* [**http://pwnable.kr/**](http://pwnable.kr/) (one of the more popular recent wargamming sets of challenges)
+* [**https://picoctf.com/**](https://picoctf.com/) (Designed for high school students while the event is usually new every year, it's left online and has a great difficulty progression)
+* [**https://microcorruption.com/login**](https://microcorruption.com/login) (one of the best interfaces, a good difficulty curve and introduction to low-level reverse engineering, specifically on an MSP430)
+* [**http://ctflearn.com/**](http://ctflearn.com/) (a new CTF based learning platform with user-contributed challenges)
+* [**http://reversing.kr/**](http://reversing.kr/)
+* [**http://hax.tor.hu/**](http://hax.tor.hu/)
+* [**https://w3challs.com/**](https://w3challs.com/)
+* [**https://pwn0.com/**](https://pwn0.com/)
+* [**https://io.netgarage.org/**](https://io.netgarage.org/)
+* [**http://ringzer0team.com/**](http://ringzer0team.com/)
+* [**http://www.hellboundhackers.org/**](http://www.hellboundhackers.org/)
+* [**http://www.overthewire.org/wargames/**](http://www.overthewire.org/wargames/)
+* [**http://counterhack.net/Counter\_Hack/Challenges.html**](http://counterhack.net/Counter_Hack/Challenges.html)
+* [**http://www.hackthissite.org/**](http://www.hackthissite.org/)
+* [**http://vulnhub.com/**](http://vulnhub.com/)
+* [**http://ctf.komodosec.com**](http://ctf.komodosec.com)
+* [**https://maxkersten.nl/binary-analysis-course/**](https://maxkersten.nl/binary-analysis-course/) (suggested by /u/ThisIsLibra, a practical binary analysis course)
+* [**https://pwnadventure.com**](https://pwnadventure.com/) (suggested by /u/startnowstop)
+
+&#x200B;
+
+[http://picoctf.com](http://picoctf.com/) is very good if you are just touching the water.
+
+and finally,
+
+[r/netsec](https://www.reddit.com/r/netsec) \- where real world vulnerabilities are shared.",https://www.reddit.com/r/hacking/comments/a3oicn/how_to_start_hacking_the_ultimate_two_path_guide/,9115,712
+10v3uiw,hacking,지붕에 수영장 - 2023 년 2 월 6 일,"Have a no0b question? New to hacking? Looking for a script? Need help with your github project? Something wrong with your payload? Stuck on a CTF or bug bounty?
+
+This is a weekly recurring post to make friends with other hackers, ask questions, and get any type of help you may need.
+
+Make sure to [read our wiki](https://old.reddit.com/r/hacking/wiki/index) as it's full of resources for you.
+
+Keep all beginner questions in this weekly stickied post.",https://www.reddit.com/r/hacking/comments/10v3uiw/pool_on_the_roof_february_06_2023/,4,0
+10x5a5w,hacking,리버스 엔지니어링 EV 충전기,,https://www.mnemonic.io/resources/blog/reverse-engineering-an-ev-charger/,145,2
+10xojhr,hacking,소프트웨어를 해킹하여 보안하는 방법을 배웁니다.,"I'm an CS student and wanted to create an app which communicates with my server. Now, I'm worried about when this app goes live, that due to my lake of knowledge about cybersecurity, my servers won't stay online for long. 
+
+That's why I asked my self if it makes sense for me to learn some hacking and hack my own servers to see where potential intruders can do something I don't want them to do or if it's just better to sign up for an cybersecurity class.
+
+Thanks in advance for taking your time.",https://www.reddit.com/r/hacking/comments/10xojhr/do_you_learn_how_to_secure_your_software_by/,5,5
+10x3rdl,hacking,큰 크기의 zip 파일의 비밀번호를 깨뜨리는 방법이 있습니까 ??,By big size I mean about 3gb or more,https://www.reddit.com/r/hacking/comments/10x3rdl/is_there_any_way_to_crack_password_of_big_size/,60,32
+10x93hy,hacking,상자를 해킹하거나 tryhackme,I've used THM for a while just wondering what  everyone elses opinions on the two are and which they think is best?,https://www.reddit.com/r/hacking/comments/10x93hy/hack_the_box_or_tryhackme/,13,11
+10xkd5h,hacking,Kali Linux BetterCap IP_Forwarding은 작동하지 않습니다,"i'm trying to use bettercap for arp spoof attack. When i started the attack, arp spoof is working normal. But ip forwarding is not working so my internet connection is lost. How can i solve this problem? If anyone knows the solution and can help me, I'd appreciate it.
+
+[normally it should be like this](https://preview.redd.it/qlbtwvhu33ha1.png?width=868&format=png&auto=webp&v=enabled&s=78ca7b9cafefb3d77eed6440de2227bb816d412c)
+
+[but this is what i have on my device](https://preview.redd.it/8giby5mx33ha1.png?width=1145&format=png&auto=webp&v=enabled&s=276e0e3dcdfe8134ac1329a8eb8345d7170b694d)",https://www.reddit.com/r/hacking/comments/10xkd5h/kali_linux_bettercap_ip_forwarding_is_not_working/,5,4
+10xhb4d,hacking,goanywhere mft Zero-Day 패치,,https://www.malwarebytes.com/blog/news/2023/02/update-now-goanywhere-mft-zero-day-patched,5,0
+10xnxs9,hacking,Metasploit은 AttackBox에서 작동하지만 내 시스템에서는 작동하지 않습니다.,"I'm using their tut and free machines to try out CLI msf  
+
+
+Same lines worked on Attackbox, but in my terminal:
+
+When it uses the auxiliary scanner for the exploit (smb ms17-010-eternalblue) I get a Rex: connection timeout  
+
+
+My guess is it's my vpn, can i tunnel to fix this?",https://www.reddit.com/r/hacking/comments/10xnxs9/metasploit_works_on_attackbox_but_not_on_my_system/,1,1
+10xm2l4,hacking,중국 풍선은 최근 양자 컴퓨터를 사용하여 RSA를 깨뜨릴 수 있다는 주장과 관련이 있습니까?,"https://techmonitor.ai/hardware/quantum-encryption-rsa-cryptography
+
+China claims that they have broken the quantum security barrier and can now crack symmetric-keys. This seems to me to be the best explanation on what they were doing with a balloon that they couldn't do with a spy satellite.",https://www.reddit.com/r/hacking/comments/10xm2l4/are_the_chinese_balloons_related_to_their_recent/,1,6
+k04tbb,Hacking_Tutorials,해킹에서 시작하는 방법 : Community Answers,"Hey everyone, we get this question a lot.
+
+""Where do I start?""
+
+It's in our rules to delete those posts because it takes away from actual tutorials. And it breaks our hearts as mods to delete those posts.
+
+To try to help, we have created this post for our community to list tools, techniques and stories about how they got started and what resources they recommend. 
+
+We'll lock this post after a bit and then re-ask again in a few months to keep information fresh. 
+
+Please share your ""how to get started"" resources below...",https://www.reddit.com/r/Hacking_Tutorials/comments/k04tbb/how_do_i_get_started_in_hacking_community_answers/,1797,313
+po1fow,Hacking_Tutorials,프로젝트에 해커가 필요합니다!?이 게시물을 참조하십시오!,"Welcome to r/hacking_tutorials and you've come to the wrong place. 
+
+We are an educational subreddit. 
+
+We are not hackers for hire, we will not help you hack your best friend's mother's girlfriend's lost password to Instagram or Snapchat. You will get reported and banned for asking. 
+
+If you were hacked by someone and need help, call your local authorities, not a bunch of random people trying to learn online. 
+
+If you're looking to learn though, you've come to a good place to ask questions and get started. Just remember, this is a professional skill set and needs to be kept legal for us to stay on reddit.",https://www.reddit.com/r/Hacking_Tutorials/comments/po1fow/need_a_hacker_for_your_project_see_this_post/,362,202
+10xkfmq,Hacking_Tutorials,CISA 및 FBI는 Esxiargs 랜섬웨어 복구 지침을 발표합니다,,https://us-cert.cisa.gov/ncas/current-activity/2023/02/08/cisa-and-fbi-release-esxiargs-ransomware-recovery-guidance,15,0
+10wwazx,Hacking_Tutorials,Python으로 Wi -Fi 암호를 얻으십시오,,https://spyros123go.medium.com/get-wifi-passwords-with-python-341f868f346b,28,2
+10wr00e,Hacking_Tutorials,해커가되는 신화와 현실 : 단순한 프로그래밍 기술 이상,,https://www.codelivly.com/the-myths-and-realities-of-becoming-a-hacker-more-than-just-programming-skills/,50,6
+10xkrkk,Hacking_Tutorials,해킹 프로젝트 연습?,Are there any free sites that can teach me basic hacking that includes mini projects?,https://www.reddit.com/r/Hacking_Tutorials/comments/10xkrkk/practice_hacking_projects/,1,3
+10x1ow9,Hacking_Tutorials,악의적 인 해킹은 chatgpt의 대체 자아를 무너 뜨린다,,https://skymagzines.com/devious-hack-unlocks-deranged-alter-ego-of-chatgpt/,10,1
+10xkgom,Hacking_Tutorials,SMS 링크를 보내서 피해자의 스마트 폰에 액세스하는 방법은 무엇입니까?누군가 내가 곤경에 처해 있다고 말해줘,I want to know the techniques for hacking with sms ... Please Tell in brief,https://www.reddit.com/r/Hacking_Tutorials/comments/10xkgom/howtoget_access_in_victims_smartphone_by_sending/,0,3
+10xcwpt,Hacking_Tutorials,ufonet,I have problems with installing ufonet by crypto file who knows if ufonet will be in service or will have any other alternative to this please?,https://www.reddit.com/r/Hacking_Tutorials/comments/10xcwpt/ufonet/,1,0
+10wwd21,Hacking_Tutorials,Windows Sysinnals 및 Windows API 학습에 관한 책에 대한 권장 사항이 있습니까?,Looking for good books on Windows C programming,https://www.reddit.com/r/Hacking_Tutorials/comments/10wwd21/does_anyone_have_any_recommendations_for_books_on/,4,1
+yrp6pq,ROS,Roscon 2022 대화 녹음이 가능합니다,,https://vimeo.com/showcase/9954564,19,2
+10xklx5,ROS,오프 주제 : Python (OPENCV)의 슬라이딩 창과 차선 탐지를위한 튜토리얼 공유 |로봇 공학 이미지 처리에 대한 리소스,,https://youtu.be/ApYo6tXcjjQ,5,0
+10xpj4y,ROS,ros2 ublox zed-f9p rtk 제발," I want to run RTK in ros2 foxy with Ublox ZED-F9P. Is there a guide or package that I can use RTK in ros2?
+
+ I try to these pakages.
+
+&#x200B;
+
+[https://github.com/KumarRobotics/ublox](https://github.com/KumarRobotics/ublox)
+
+[https://github.com/leighleighleigh/ublox\_dgnss](https://github.com/leighleighleigh/ublox_dgnss)
+
+[https://github.com/sibalzer/ublox-foxy-RTCM-correction-](https://github.com/sibalzer/ublox-foxy-RTCM-correction-)
+
+&#x200B;
+
+ I publish RTCM massages with ros2 ntrip pakage and I checked Ublox gps pakage subscribe RTCM message with rqt\_graph. but It failed",https://www.reddit.com/r/ROS/comments/10xpj4y/ros2_ublox_zedf9p_rtk_please/,1,0
+10wr4fi,ROS,ROS 2 내비게이션 스택을 사용하는 40 개 이상의 회사가 있다는 것을 알고 있습니까?ROS 2 NAV 스택으로 로봇 항법의 미래를 가속화하여 하드웨어의 전력을 활용하여 로봇 내비게이션의 속도와 정확성을 향상시킵니다.,,https://i.redd.it/kkgnyqeu9xga1.png,15,6
+10wuzt2,ROS,베타 5 릴리스 |행동tree.cpp,,https://www.behaviortree.dev/blog/beta5/,6,0
+10wu7tf,ROS,모두 하나!밀도가 높은 포인트 클라운드와 IMU가없는 매우 낮은 CPU 오버 헤드가있는 ARM 기반 스테레오 슬램 (Demo Test)은 충분한 계산 성이 남아있었습니다.,,https://v.redd.it/liwlie5rfxga1,6,0
+10xa22b,ROS,M1 Mac에서 ROS Noetic을 실행하십시오,I currently have an M1 mac and need to run ROS Noetic. Is it better to build it from source (if possible) or run it on docker? Can anyone give me a good guide for either? Thanks.,https://www.reddit.com/r/ROS/comments/10xa22b/run_ros_noetic_on_m1_mac/,1,3
+10x98l1,ROS,ROS2-HUMBLE 설치에 도움이 필요합니다,"I know this issue was previously discussed [here](https://github.com/ros-drivers/joystick_drivers/issues/241):
+
+However, I tried all the mentioned methods to fix the installation issue, and I did update and upgrade all the packages, but ROS2 won't install. The following error was produced after I followed this [post here](https://linuxopsys.com/topics/install-ros-2-humble-on-ubuntu) step by step:
+
+&#x200B;
+
+`Reading package lists...`
+
+`Building dependency tree...`
+
+`Reading state information...`
+
+`Some packages could not be installed. This may mean that you have`
+
+`requested an impossible situation or if you are using the unstable`
+
+`distribution that some required packages have not yet been created`
+
+`or been moved out of Incoming.`
+
+`The following information may help to resolve the situation:`
+
+&#x200B;
+
+`The following packages have unmet dependencies:`
+
+`libarmadillo10 : Depends: liblapack3 but it is not installable or`
+
+`liblapack.so.3`
+
+`libarpack2 : Depends: libgfortran5 (>= 8) but it is not installable`
+
+`Depends: liblapack3 but it is not installable or`
+
+`liblapack.so.3`
+
+`libarpack2-dev : Depends: liblapack-dev but it is not installable or`
+
+[`liblapack.so`](https://liblapack.so)
+
+`libdbus-1-dev : Depends: libdbus-1-3 (= 1.12.20-2ubuntu4) but 1.12.20-2ubuntu4.1 is to be installed`
+
+`libglib2.0-dev : Depends: libglib2.0-0 (= 2.72.1-1) but 2.72.4-0ubuntu1 is to be installed`
+
+`Depends: libglib2.0-bin (= 2.72.1-1)`
+
+`Depends: libglib2.0-dev-bin (= 2.72.1-1)`
+
+`libhdf5-fortran-102 : Depends: libgfortran5 (>= 8) but it is not installable`
+
+`libhdf5-hl-fortran-100 : Depends: libgfortran5 (>= 8) but it is not installable`
+
+`libhdf5-openmpi-fortran-102 : Depends: libgfortran5 (>= 8) but it is not installable`
+
+`libhdf5-openmpi-hl-fortran-100 : Depends: libgfortran5 (>= 8) but it is not installable`
+
+`libjson-c-dev : Depends: libjson-c5 (= 0.15-2build4) but 0.15-3~ubuntu1.22.04.1 is to be installed`
+
+`libopenmpi-dev : Depends: gfortran-11 but it is not installable or`
+
+`gfortran-mod-15`
+
+`Recommends: libcoarrays-openmpi-dev but it is not installable`
+
+`libpcre2-dev : Depends: libpcre2-8-0 (= 10.39-3build1) but 10.39-3ubuntu0.1 is to be installed`
+
+`Depends: libpcre2-32-0 (= 10.39-3build1) but 10.39-3ubuntu0.1 is to be installed`
+
+`libpoppler-dev : Depends: libpoppler118 (= 22.02.0-2) but 22.02.0-2ubuntu0.1 is to be installed`
+
+`libpq-dev : Depends: libpq5 (= 14.2-1ubuntu1) but 14.5-0ubuntu0.22.04.1 is to be installed`
+
+`libpulse-dev : Depends: libpulse0 (= 1:15.99.1+dfsg1-1ubuntu1) but 1:15.99.1+dfsg1-1ubuntu2 is to be installed`
+
+`Depends: libpulse-mainloop-glib0 (= 1:15.99.1+dfsg1-1ubuntu1) but 1:15.99.1+dfsg1-1ubuntu2 is to be installed`
+
+`libtiff-dev : Depends: libjbig-dev but it is not going to be installed`
+
+`Depends: libtiff5 (= 4.3.0-6) but 4.3.0-6ubuntu0.3 is to be installed`
+
+`libudev-dev : Depends: libudev1 (= 249.11-0ubuntu3) but 249.11-0ubuntu3.6 is to be installed`
+
+`libusb-1.0-0-dev : Depends: libusb-1.0-0 (= 2:1.0.25-1ubuntu1) but 2:1.0.25-1ubuntu2 is to be installed`
+
+`Recommends: libusb-1.0-doc but it is not going to be installed`
+
+`libvtk9-dev : Depends: libfreetype6-dev`
+
+`libwayland-dev : Depends: libwayland-client0 (= 1.20.0-1) but 1.20.0-1ubuntu0.1 is to be installed`
+
+`Depends: libwayland-server0 (= 1.20.0-1) but 1.20.0-1ubuntu0.1 is to be installed`
+
+`Depends: libwayland-cursor0 (= 1.20.0-1) but 1.20.0-1ubuntu0.1 is to be installed`
+
+`Depends: libwayland-egl1 (= 1.20.0-1) but 1.20.0-1ubuntu0.1 is to be installed`
+
+`libxft-dev : Depends: libfontconfig1-dev`
+
+`Depends: libfreetype6-dev`
+
+`libxml2-dev : Depends: libxml2 (= 2.9.13+dfsg-1build1) but 2.9.13+dfsg-1ubuntu0.2 is to be installed`
+
+&#x200B;
+
+`......`
+
+&#x200B;
+
+`E: Unable to correct problems, you have held broken packages.`
+
+&#x200B;
+
+Any help would be greatly appreciated! I simply can't figure out why these errors popped up though I have updated all the packages with \`sudo apt update\` and \`sudo apt upgrade\`",https://www.reddit.com/r/ROS/comments/10x98l1/need_help_on_ros2humble_installation/,1,1
+10x5htr,ROS,고위급 및 큰 메시지로 ROS 1 및 2 스택에 안정적으로 연결,,https://foxglove.dev/blog/announcing-the-new-foxglove-bridge-for-live-ros-data,1,0
+10xi8kz,ROS,ROS 인 설치 악몽,"I've been battling with the simplest task of installing this dumpster-fire for the past 6 hours and still haven't succeeded, here's what I've went though so far:
+
+Flashed a Ubuntu 22.10 to my Raspberry pi.
+
+After hours I finally get the note that actually, ROS 1 doesn't support anything above 20.04.
+
+Flashes Ubuntu 20.04 server, then desktop.
+
+Goes through the Noetic installation.
+
+\-->E: Unable to locate package ros-noetic-desktop-full
+
+Another 2 hours of trouble shooting endding up with:  E: Unable to locate package ros-noetic-desktop-full",https://www.reddit.com/r/ROS/comments/10xi8kz/the_installation_nightmare_that_is_ros/,0,4
+h89gme,gamedev,*게시하기 전에 읽으십시오*,"There are only 4 rules:
+
+1. **No show-off posts.** 
+-
+This includes *general feedback*, WIP, screenshots, kickstarters, blogs, memes, ""play my game"", twitch streams. 
+
+Use [/r/gamedev discord](https://discord.gg/reddit-gamedev), /r/indiegames, /r/playmygame or /r/gamedevscreens, or one of the weekly threads such as Screenshot Saturday.
+
+
+2. **Be specific about your question.** 
+-
+If you are a beginner, [read the FAQ](https://www.reddit.com/r/gamedev/wiki/faq#wiki_getting_started). Screenshots are OK so long as it illustrates your *specific issues*.
+
+
+3. **Do not solicit employment.** 
+-
+Use /r/inat or /r/gameDevClassifieds. This includes offering free work.
+
+4. **No paid assets.** 
+-
+Use [reddit ads instead](https://www.redditinc.com/advertising). Free assets OK, be sure to specify license.
+
+---
+
+We kindly ask you to consider the rules of the sub before posting a new thread.
+
+For details on why these rules exiist, see [Welcome to /r/gamedev 2020 Edition](https://www.reddit.com/r/gamedev/comments/g1xe1f/welcome_to_rgamedev_2020_edition_read_this_first/).",https://www.reddit.com/r/gamedev/comments/h89gme/please_read_before_you_post/,873,0
+10x9t6k,gamedev,학점 화면에 음악 아티스트 페이지에 대한 링크가 있기 때문에 Steam은 내 빌드를 거부했습니다.이 아티스트들은 (실제로) 무료 게임에 무료로 음악을 포함시키는 것을 받아 들였습니다. 링크를 제거하면 보이지 않습니다.어떡해?,"They say there are call-to-action to buy on their Bandcamp page (which is not true for all by the way). They say I can only use links to things users can buy on steam. I have nothing to sell, the game is free, music is free :'(",https://www.reddit.com/r/gamedev/comments/10x9t6k/steam_refused_my_build_because_there_are_links_to/,256,102
+10x5pbl,gamedev,릴리스 후보 : Godot 4.0 RC 1,,https://godotengine.org/article/release-candidate-godot-4-0-rc-1/,211,29
+10wv68n,gamedev,"Web3, NFT, Crypto, Games의 블록 체인 .. _anyone_가 관리합니까?","I've yet to see even a single compelling reason why anyone would want to use any of the aforementioned buzzwords in a game - both from player and developer perspective (but I'm not including VC/board level as I don't care that Yves Guillemot thinks there money to be made in there somewhere)
+
+And I mean both when it comes to the ""possibilities they enable"" and the ""technical problems they solve"". Every pitch I've ever seen the answer has been: it enables nothing and it solves nothing.  It's always the case that someone comes running with a preconceived solution and are looking for a problem to apply it to.
+
+Change my mind? Or don't.. but I do wonder if anyone actually has or has ever come across something where it would actually be useful or at the very least a decent fit.",https://www.reddit.com/r/gamedev/comments/10wv68n/web3_nft_crypto_blockchain_in_games_does_anyone/,403,571
+10xq7vr,gamedev,포인트 및 클릭 텍스트 기반 게임에 대한 트레일러를 얼마나 가장 잘 구현 하시겠습니까?,I've got my steam page finally done but I'm wondering if there's actually an interesting way of making a trailer for a game that's a point and click with a lot of reading. I've got a teaser I'm satisfied with but the gameplay trailer I'm still lost on.,https://www.reddit.com/r/gamedev/comments/10xq7vr/how_best_would_you_implement_a_trailer_for_a/,3,3
+10x9woj,gamedev,최근 AAA Studio에 합류했습니다,"Hello guys, I recently joined AAA studio as beginner (one week ago). It is not in my country so I moved in different country and even tho official language is English, internal communication is mostly on local language. I dont know it so not everyone is communicating with me, actually small amount of people is talking to me. 
+
+What I feel right now is like I've bitten much more than I could chew and now I am in the company where it is hard to understand organisation of the company, things that I should do, how should I do it, so much information I received in couple of days. 
+
+I feel like I am much more behind my colleagues, they all know how to finish their tasks and I am stuck on my first. I never worked in gamedev studio, especially not this big, so if anyone has any advice for me, how to move forward, how to behave, how much time is reasonable to adjust to new environment. Any piece of advice and support is more than welcome.
+
+I cant give up just after one week but I feel like I dont deserve to be here.",https://www.reddit.com/r/gamedev/comments/10x9woj/recently_joined_aaa_studio/,28,21
+10xn8df,gamedev,마침내 고등 교육에서 게임 개발을 시작했습니다 !!!,"ive been on and off learning c#, unity and game dev assets but im so excited to say ive been accepted into and studying game development in an official setting to get a degree!!!! any advice from others who have been studying/have studied?",https://www.reddit.com/r/gamedev/comments/10xn8df/finally_starting_game_dev_at_higher_education/,3,5
+10wy13o,gamedev,모바일 게임의 UI를 어떻게 개선 할 수 있습니까?,,https://v.redd.it/uj84dyhm5zga1,52,49
+10wlxk2,gamedev,방금 게임 스튜디오에서 일자리를 제공했고 받아 들였습니다.지난 8 개월 동안 내 엉덩이를 벗기면서 5 년의 켜기와 꺼짐이 필요했습니다.그러나 지금 나는 올 수있는 것에 대해 겁에 질려있다.어떤 충고?,"I am very proud of myself to have gotten this far but as the title states, I am terrified. Any advice on what I should do or shouldn't do?
+
+Edit: Thank you to everyone that's posted a comment so far, it's really helped! I will reply once I've had sleep haha. I am going in as a junior artist, yes! It's my first job.",https://www.reddit.com/r/gamedev/comments/10wlxk2/i_just_got_offered_a_job_at_a_games_studio_and_i/,395,122
+10wuqf2,gamedev,나는 Lostgarden Game Dev 블로그와 사랑에 빠졌습니다. 비슷한 품질의 블로그를 어디서 구할 수 있습니까?,"I've consumed literally every single post of the [Lost Garden](https://lostgarden.home.blog/2021/12/12/value-chains/) blog. Each post is straight signal ZERO noise. I like how it explores hard problems with integrity, and doesn't feel like journalism by an outsider. This blog was a chance discovery (am I gonna google gardens that have been lost?) so I'm afraid I'm missing out on yet more blogs that are worth my time. Koster is another that comes to mind for quality. Both blogs aren't about being trendy and popular, but about delivering knowledge derived from experience and theories meant for internal use (often with studies to back it up!). That's the good stuff.
+
+What gamedev (text-based) blogs do you religiously read? What do you think makes it top tier?",https://www.reddit.com/r/gamedev/comments/10wuqf2/im_in_love_with_the_lostgarden_game_dev_blog/,83,12
+syyzu9,Hiphopcirclejerk,Souljah Boy는 Donetsk People 's Republic의 독립성을 인정 한 최초의 랩퍼였습니다.,,https://imgur.com/DRc7M6J.jpg,5145,114
+10r6f7a,Hiphopcirclejerk,나는 방금이 서브 전체를 능가했다,"Theres this pretty Latina girl in my class and she was showing me what music she likes to listen to, bachata, Esteban Almorado, Nardo Wick an shit I decide to show her some of my music n my dumb ass played FUCKING AINT IT FUNNY BY DANNY BROWN. She looked at me weird n I think I fumbled 😭😭",https://www.reddit.com/r/Hiphopcirclejerk/comments/10r6f7a/i_just_outjerked_this_whole_sub/,1348,130
+10xcr9o,Hiphopcirclejerk,IMF,,https://i.redd.it/oxbh95vyz2ha1.jpg,771,32
+10xap8a,Hiphopcirclejerk,충분한 시간이 지났습니다,,https://i.redd.it/w8j5ciq0m2ha1.jpg,265,11
+10wn44i,Hiphopcirclejerk,다시 시작했다,,https://i.redd.it/lvdxae97nxga1.jpg,1704,51
+10xhb5t,Hiphopcirclejerk,Bruh 뭐,,https://i.redd.it/btlbncfkw3ha1.jpg,19,3
+10wx906,Hiphopcirclejerk,진짜 랩,,https://i.redd.it/j5yq0kpch0ha1.jpg,136,5
+10xhg0x,Hiphopcirclejerk,Lil B는 문화를 위해 더 많은 일을했고 Kendrick Lamar,no explanation.,https://www.reddit.com/r/Hiphopcirclejerk/comments/10xhg0x/lil_b_did_more_for_the_culture_then_kendrick_lamar/,10,3
+10wxmjj,Hiphopcirclejerk,Ude,,https://i.redd.it/r9v51dc6k0ha1.jpg,65,2
+10xhtrg,Hiphopcirclejerk,켄드릭은 너무 많은 단어를 말합니다,I think Kenny is a nerd,https://i.redd.it/v2itnzyl04ha1.jpg,7,4
